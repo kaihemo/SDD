@@ -83,14 +83,11 @@ class SDDLinear(torch.nn.Module):
 ## Citing this work
 If you find this work helpful or use it in your research, please consider citing our paper:
 ```bibtex
-@misc{wang2025scaledistributiondecouplingenablingstable,
-      title={Scale-Distribution Decoupling: Enabling Stable and Effective Training of Large Language Models}, 
-      author={Ya Wang and Zhijian Zhuo and Yutao Zeng and Xun Zhou and Jian Yang and Xiaoqing Li},
-      year={2025},
-      eprint={2502.15499},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2502.15499}, 
+@article{wang2025scale,
+  title={Scale-Distribution Decoupling: Enabling Stable and Effective Training of Large Language Models},
+  author={Wang, Ya and Zhuo, Zhijian and Zeng, Yutao and Zhou, Xun and Yang, Jian and Li, Xiaoqing},
+  journal={arXiv preprint arXiv:2502.15499},
+  year={2025}
 }
 ```
 
