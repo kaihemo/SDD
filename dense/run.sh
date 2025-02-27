@@ -15,7 +15,7 @@ MOUNT_DIR="/mnt/hdfs/mount_dir"
 CODE_DIR="/opt/tiger/olmo"
 
 # 以下为可修改的几个配置, run_name: 任务名, DEBUG_FLAG: 是否为debug环境(0 or 1, 防止hdfs上产生太多无效目录)
-export run_name="dense_baseline_1B2_64H100"
+export run_name="dense_baseline_1B2_sdd_64H100"
 DEBUG_FLAG=0
 CONFIG_PATH=${CODE_DIR}/configs/exps/LLaMA-3.2-1B-like-stage1.yaml
 # =========================== 重要配置 ===========================
@@ -90,7 +90,7 @@ sh launch.sh ${CONFIG_PATH} \
 --model.attention_layer_norm=true \
 --model.attention_layer_norm_with_affine=true \
 --model.convert2fp32=false \
---model.init_std=0.013975424859373685 \
+--model.init_std=0.0013975424859373685 \
 --model.init_fn="full_megatron" \
 --max_duration=2e12T \
 --scheduler.t_warmup=8388608000 \

@@ -25,6 +25,13 @@ from typing import (
     cast,
 )
 
+from megablocks.layers import common
+from megablocks.layers.activation_fn import act_fn
+from megablocks.layers.mlp import SparseMLP, create_dmoe_expert_weights, resolve_dtensor
+from megablocks.layers import mpu
+from megablocks.layers.arguments import Arguments
+import stk
+
 import torch
 import torch.backends.cuda
 import torch.nn as nn
@@ -103,6 +110,129 @@ def should_checkpoint_block(strategy: Optional[ActivationCheckpointingStrategy],
         return True
     else:
         return False
+
+
+class SparseGLU(SparseMLP):
+
+    def __init__(self, args: Arguments):
+        super().__init__(args)
+        self.v1 = torch.nn.Parameter(torch.empty(
+            self._num_rows_per_rank,
+            args.hidden_size,
+            device=args.device,
+            dtype=common.dtype(args)))
+        with torch.no_grad():
+            self.v1.copy_(create_dmoe_expert_weights(
+                args, args.moe_num_experts, args.ffn_hidden_size,
+                args.hidden_size, args.init_method))
+
+        mpu.set_expert_model_parallel_attributes(
+            self.v1, self._should_set_parallelism_attribute)
+        
+        self.fc1_norm_weight = torch.nn.Parameter(torch.empty(
+            self._num_rows_per_rank,
+            1,
+            device=args.device,
+            dtype=common.dtype(args)))
+        with torch.no_grad():
+            self.fc1_norm_weight.copy_(create_dmoe_expert_weights(
+                args, args.moe_num_experts, args.ffn_hidden_size,
+                1, partial(torch.nn.init.constant_, val=1)))
+
+        mpu.set_expert_model_parallel_attributes(
+            self.fc1_norm_weight, self._should_set_parallelism_attribute)
+        
+        self.fc2_norm_weight = torch.nn.Parameter(torch.empty(
+            self._num_rows_per_rank,
+            1,
+            device=args.device,
+            dtype=common.dtype(args)))
+        with torch.no_grad():
+            self.fc2_norm_weight.copy_(create_dmoe_expert_weights(
+                args, args.moe_num_experts, args.ffn_hidden_size,
+                1, partial(torch.nn.init.constant_, val=1)))
+
+        mpu.set_expert_model_parallel_attributes(
+            self.fc2_norm_weight, self._should_set_parallelism_attribute)
+        self.fc_out_norm_weight = torch.nn.Parameter(torch.empty(
+            args.moe_num_experts * args.hidden_size,
+            1,
+            device=args.device,
+            dtype=common.dtype(args)))
+        with torch.no_grad():
+            self.fc_out_norm_weight.copy_(create_dmoe_expert_weights(
+                args, args.moe_num_experts, args.hidden_size,
+                1, partial(torch.nn.init.constant_, val=1/math.sqrt(2*self.args.num_layers))))
+
+        mpu.set_expert_model_parallel_attributes(
+            self.fc_out_norm_weight, self._should_set_parallelism_attribute)
+
+        if self.args.moe_weight_parallelism:
+            raise NotImplementedError("Weight parallelism not yet supported with GLU.")
+        self.fc1_norm = None
+        self.fc2_norm = None
+        self.fc_out_norm = None
+
+    def apply_norm(self, input_tensor, norm_op):
+        if norm_op:
+            raw_shape = input_tensor.data.shape
+            hidden_size = int(self.config.d_model * 0.5)
+            input_tensor_data = input_tensor.data.reshape(-1, int(hidden_size / raw_shape[-2]), raw_shape[-2], raw_shape[-2])
+            input_tensor_data = input_tensor_data.permute(0,2,1,3).contiguous()
+            input_tensor_data = input_tensor_data.reshape(input_tensor_data.shape[0], input_tensor_data.shape[1], -1)
+            input_tensor_data = torch.utils.checkpoint.checkpoint(norm_op, input_tensor_data, use_reentrant=False)
+            reshaped_input_tensor_data = input_tensor_data.reshape(input_tensor_data.shape[0], input_tensor_data.shape[1], int(hidden_size / raw_shape[-2]), raw_shape[-2])
+            reshaped_input_tensor_data = reshaped_input_tensor_data.permute(0,2,1,3).contiguous()
+            reshaped_input_tensor_data = reshaped_input_tensor_data.reshape(raw_shape)
+
+            return reshaped_input_tensor_data
+        else:
+            return input_tensor.data
+        
+    def forward(self, x, topo):
+        if self.args.memory_optimized_mlp:
+            raise NotImplementedError("Memory optimized implementation not yet supported with GLU with sparse kernels.")
+
+        w1, v1, w2 = self.scale_grad(self.w1), self.scale_grad(self.v1), self.scale_grad(self.w2)
+        w1, v1, w2 = resolve_dtensor(w1), resolve_dtensor(v1), resolve_dtensor(w2)
+
+        # Compute the GLU.
+        x1 = stk.ops.sdd(x, w1.t(), topo)
+        x2 = stk.ops.sdd(x, v1.t(), topo)
+        x1._data = self.apply_norm(x1, self.fc1_norm)
+        x2._data = self.apply_norm(x2, self.fc2_norm)
+
+        fc1_norm_weight = self.scale_grad(self.fc1_norm_weight)
+        fc1_norm_weight = resolve_dtensor(fc1_norm_weight)
+        fc1_norm_weight = fc1_norm_weight.repeat([1, self.config.d_model])
+        ones_matrix = torch.ones_like(x) / self.config.d_model
+        reorg_fc1_norm_weight = stk.ops.sdd(ones_matrix, fc1_norm_weight.t(), topo)
+        x1 = stk.ops.eltwise_ops.mul(x1, reorg_fc1_norm_weight)
+
+        fc2_norm_weight = self.scale_grad(self.fc2_norm_weight)
+        fc2_norm_weight = resolve_dtensor(fc2_norm_weight)
+        fc2_norm_weight = fc2_norm_weight.repeat([1, self.config.d_model])
+        reorg_fc2_norm_weight = stk.ops.sdd(ones_matrix, fc2_norm_weight.t(), topo)
+        x2 = stk.ops.eltwise_ops.mul(x2, reorg_fc2_norm_weight)
+
+        activation_fn_out = act_fn(x1, self.args.activation_fn)
+        x1 = stk.ops.mul(activation_fn_out, x2)
+
+        output = stk.ops.dsd(x1, w2)
+        output = torch.utils.checkpoint.checkpoint(self.fc_out_norm, output, use_reentrant=False)
+        
+        fc_out_norm_weight = self.scale_grad(self.fc_out_norm_weight)
+        fc_out_norm_weight = resolve_dtensor(fc_out_norm_weight)
+        ones_matrix2 = stk.ops.ones_like(x1)
+        fc_out_norm_weight = fc_out_norm_weight.repeat((1, self.args.ffn_hidden_size))
+        fc_out_norm_weight = fc_out_norm_weight.reshape(self.config.moe_num_experts, -1, self.args.ffn_hidden_size)
+        fc_out_norm_weight = fc_out_norm_weight.transpose(1, 2)
+        fc_out_norm_weight = fc_out_norm_weight.reshape(-1, self.config.d_model)
+        reorg_fc_out_norm_weight = stk.ops.dsd(ones_matrix2, fc_out_norm_weight) / self.config.moe_num_experts
+
+        output = output * reorg_fc_out_norm_weight
+
+        return output
 
 
 class BufferCache(dict, MutableMapping[str, torch.Tensor]):
@@ -431,6 +561,8 @@ class OLMoBlock(nn.Module):
         # Layer norms.
         self.k_norm: Optional[LayerNormBase] = None
         self.q_norm: Optional[LayerNormBase] = None
+        self.context_norm: Optional[LayerNormBase] = None
+        self.attention_out_norm: Optional[LayerNormBase] = None
         if config.attention_layer_norm:
             assert config.effective_n_kv_heads is not None
             self.k_norm = LayerNormBase.build(
@@ -439,6 +571,21 @@ class OLMoBlock(nn.Module):
                 elementwise_affine=config.attention_layer_norm_with_affine,
             )
             self.q_norm = LayerNormBase.build(config, size=config.d_model // config.n_heads, elementwise_affine=config.attention_layer_norm_with_affine)
+
+        self.context_norm = LayerNormBase.build(
+            config,
+            size=config.d_model,
+            elementwise_affine=config.attention_layer_norm_with_affine,
+        )
+        self.attention_out_norm = LayerNormBase.build(
+            config,
+            size=config.d_model,
+            elementwise_affine=config.attention_layer_norm_with_affine,
+        )
+
+        self.fc1_norm = LayerNorm.build(config, elementwise_affine=False, size=int(self.hidden_size * 0.5))
+        self.fc2_norm = LayerNorm.build(config, elementwise_affine=False, size=int(self.hidden_size * 0.5))
+        self.fc_out_norm = LayerNorm.build(config, elementwise_affine=False, size=config.d_model)
 
         # Make sure QKV clip coefficient is positive, otherwise it's not well-defined.
         if config.clip_qkv is not None:
@@ -486,6 +633,16 @@ class OLMoBlock(nn.Module):
             self.k_norm.reset_parameters()
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
+        if self.context_norm is not None:
+            self.context_norm.reset_parameters()
+        if self.attention_out_norm is not None:
+            self.attention_out_norm.reset_parameters()
+        if self.fc1_norm is not None:
+            self.fc1_norm.reset_parameters()
+        if self.fc2_norm is not None:
+            self.fc2_norm.reset_parameters()
+        if self.fc_out_norm is not None:
+            self.fc_out_norm.reset_parameters()
 
         if self.config.init_fn == InitFnType.normal:
             attn_out_std = ff_out_std = self.config.init_std
@@ -503,9 +660,12 @@ class OLMoBlock(nn.Module):
         else:
             raise NotImplementedError(self.config.init_fn)
 
-        init_normal(self.attn_out, std=attn_out_std, init_cutoff_factor=cutoff_factor)
-        if hasattr(self, 'ff_out'):
-            init_normal(self.ff_out, std=ff_out_std, init_cutoff_factor=cutoff_factor)
+        init_normal(self.attn_out, std=self.config.init_std, init_cutoff_factor=cutoff_factor)
+
+        if self.attention_out_norm.weight is not None:
+            self.attention_out_norm.weight.data /= math.sqrt(2.0 * self.config.n_layers)
+        if self.fc_out_norm.weight is not None:
+            self.fc_out_norm.weight.data /= math.sqrt(2.0 * self.config.n_layers)
 
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
@@ -648,9 +808,20 @@ class OLMoBlock(nn.Module):
 
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
+        if self.context_norm:
+            if self._activation_checkpoint_fn is not None:
+                att = self._activation_checkpoint_fn(self.context_norm, att)
+            else:
+                att = self.context_norm(att)
 
+        attention_out = self.attn_out(att)
         # Apply output projection.
-        return self.attn_out(att), present
+        if self.attention_out_norm:
+            if self._activation_checkpoint_fn is not None:
+                attention_out = self._activation_checkpoint_fn(self.attention_out_norm, attention_out)
+            else:
+                attention_out = self.attention_out_norm(attention_out)
+        return attention_out, present
 
     @abstractmethod
     def forward(
@@ -684,6 +855,9 @@ class OLMoEBlock(OLMoBlock):
 
     def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
         try:
+            from megablocks.layers import dmlp_registry
+            dmlp_registry._REGISTRY['glu']['sparse'] = SparseGLU
+
             from megablocks.layers.dmoe import dMoE
             from megablocks.layers.moe import MoE
         except ImportError:
@@ -696,6 +870,10 @@ class OLMoEBlock(OLMoBlock):
 
         self.moe_args = config_to_moe_args(config)
         self.ffn = dMoE(self.moe_args) if self.config.moe_dropless else MoE(self.moe_args)
+        self.ffn.experts.mlp.fc1_norm = self.fc1_norm
+        self.ffn.experts.mlp.fc2_norm = self.fc2_norm
+        self.ffn.experts.mlp.fc_out_norm = self.fc_out_norm
+        self.ffn.experts.mlp.config = config
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
 
@@ -714,31 +892,31 @@ class OLMoEBlock(OLMoBlock):
         super().reset_parameters()
 
         if self.config.init_fn == InitFnType.normal:
-            attn_out_std = ff_out_std = in_std = self.config.init_std
             cutoff_factor = self.config.init_cutoff_factor
         elif self.config.init_fn == InitFnType.mitchell:
             in_std = 1 / math.sqrt(self.config.d_model)
-            attn_out_std = 1 / (math.sqrt(2 * self.config.d_model * (self.layer_id + 1)))
-            ff_out_std = 1 / (math.sqrt(2 * self.ff_out.in_features * (self.layer_id + 1)))
             cutoff_factor = self.config.init_cutoff_factor or 3.0
         elif self.config.init_fn == InitFnType.full_megatron:
             in_std = self.config.init_std
-            attn_out_std = ff_out_std = self.config.init_std / math.sqrt(2.0 * self.config.n_layers)
             cutoff_factor = self.config.init_cutoff_factor or 3.0
         else:
             raise NotImplementedError(self.config.init_fn)
 
-        init_normal(self.att_proj, std=in_std, init_cutoff_factor=cutoff_factor)
-        init_normal(self.attn_out, std=attn_out_std, init_cutoff_factor=cutoff_factor)
         self.attn_norm.reset_parameters()
         self.ff_norm.reset_parameters()
+
+        init_normal(self.att_proj, std=in_std, init_cutoff_factor=cutoff_factor)
+    
         init_normal(self.ffn.experts.mlp.w1, std=in_std, init_cutoff_factor=cutoff_factor)
-        init_normal(self.ffn.experts.mlp.w2, std=ff_out_std, init_cutoff_factor=cutoff_factor)
+        init_normal(self.ffn.experts.mlp.w2, std=in_std, init_cutoff_factor=cutoff_factor)
         if hasattr(self.ffn.experts.mlp, "v1"):
             init_normal(self.ffn.experts.mlp.v1, std=in_std, init_cutoff_factor=cutoff_factor)
         if self.ffn.experts.bias is not None:
             torch.nn.init.zeros_(self.ffn.experts.bias)
         init_normal(self.ffn.router.layer, std=in_std, init_cutoff_factor=cutoff_factor)
+        torch.nn.init.constant_(self.ffn.experts.mlp.fc1_norm_weight, 1)
+        torch.nn.init.constant_(self.ffn.experts.mlp.fc2_norm_weight, 1)
+        torch.nn.init.constant_(self.ffn.experts.mlp.fc_out_norm_weight, 1 / math.sqrt(2.0 * self.config.n_layers))
 
     def forward(
         self,
@@ -756,19 +934,17 @@ class OLMoEBlock(OLMoBlock):
         #                      k, v: (batch_size, seq_len, d_model // n_heads)
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
-        if not self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                qkv = self.att_proj(self._activation_checkpoint_fn(self.attn_norm, x))
-            else:
-                qkv = self.att_proj(self.attn_norm(x))
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.attn_norm, x)
         else:
-            qkv = self.att_proj(x)
+            x = self.attn_norm(x)
+
+        qkv = self.att_proj(x)
 
         if self.config.clip_qkv is not None:
             qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
 
         q, k, v = qkv.split(self.fused_dims, dim=-1)
-
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
@@ -806,22 +982,15 @@ class OLMoEBlock(OLMoBlock):
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
+        else:
+            x = self.ff_norm(x)
+
         og_x = x
 
-        if self.config.norm_after:
-            x = self.ffn(x)
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
-            else:
-                x = self.ff_norm(x)
-            return og_x + self.dropout(x), cache
-        else:
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
-            else:
-                x = self.ff_norm(x)
-            # Activation checkpointing for the MoE FFN is not supported
-            return og_x + self.dropout(self.ffn(x)), cache
+        # Activation checkpointing for the MoE FFN is not supported
+        return og_x + self.dropout(self.ffn(x)), cache
 
 
 class OLMoSequentialBlock(OLMoBlock):

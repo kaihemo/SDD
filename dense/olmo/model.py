@@ -432,6 +432,8 @@ class OLMoBlock(nn.Module):
         # Layer norms.
         self.k_norm: Optional[LayerNormBase] = None
         self.q_norm: Optional[LayerNormBase] = None
+        self.context_norm: Optional[LayerNormBase] = None
+        self.attention_out_norm: Optional[LayerNormBase] = None
         if config.attention_layer_norm:
             assert config.effective_n_kv_heads is not None
             q_norm_dim, k_norm_dim = config.d_model // config.n_heads, config.d_model // config.n_heads
@@ -447,6 +449,19 @@ class OLMoBlock(nn.Module):
                 size=q_norm_dim,
                 elementwise_affine=config.attention_layer_norm_with_affine,
             )
+            self.context_norm = LayerNormBase.build(
+                config,
+                size=config.d_model,
+                elementwise_affine=config.attention_layer_norm_with_affine,
+            )
+            self.attention_out_norm = LayerNormBase.build(
+                config,
+                size=config.d_model,
+                elementwise_affine=config.attention_layer_norm_with_affine,
+            )
+        
+        self.fc1_norm = LayerNorm.build(config, size=self.hidden_size)
+        self.fc2_norm = LayerNorm.build(config, size=config.d_model)
 
         # Make sure QKV clip coefficient is positive, otherwise it's not well-defined.
         if config.clip_qkv is not None:
@@ -493,6 +508,14 @@ class OLMoBlock(nn.Module):
             self.k_norm.reset_parameters()
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
+        if self.context_norm is not None:
+            self.context_norm.reset_parameters()
+        if self.attention_out_norm is not None:
+            self.attention_out_norm.reset_parameters()
+        if self.fc1_norm is not None:
+            self.fc1_norm.reset_parameters()
+        if self.fc2_norm is not None:
+            self.fc2_norm.reset_parameters()
 
         if self.config.init_fn == InitFnType.normal:
             attn_out_std = ff_out_std = self.config.init_std
@@ -510,8 +533,13 @@ class OLMoBlock(nn.Module):
         else:
             raise NotImplementedError(self.config.init_fn)
 
-        init_normal(self.attn_out, std=attn_out_std, init_cutoff_factor=cutoff_factor)
-        init_normal(self.ff_out, std=ff_out_std, init_cutoff_factor=cutoff_factor)
+        init_normal(self.attn_out, std=self.config.init_std, init_cutoff_factor=cutoff_factor)
+        init_normal(self.ff_out, std=self.config.init_std, init_cutoff_factor=cutoff_factor)
+
+        if self.attention_out_norm.weight is not None:
+            self.attention_out_norm.weight.data /= math.sqrt(2.0 * self.config.n_layers)
+        if self.fc2_norm.weight is not None:
+            self.fc2_norm.weight.data /= math.sqrt(2.0 * self.config.n_layers)
 
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
@@ -662,9 +690,20 @@ class OLMoBlock(nn.Module):
 
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
+        if self.context_norm:
+            if self._activation_checkpoint_fn is not None:
+                att = self._activation_checkpoint_fn(self.context_norm, att)
+            else:
+                att = self.context_norm(att)
 
+        attention_out = self.attn_out(att)
         # Apply output projection.
-        return self.attn_out(att), present
+        if self.attention_out_norm:
+            if self._activation_checkpoint_fn is not None:
+                attention_out = self._activation_checkpoint_fn(self.attention_out_norm, attention_out)
+            else:
+                attention_out = self.attention_out_norm(attention_out)
+        return attention_out, present
 
     @abstractmethod
     def forward(
@@ -756,15 +795,12 @@ class OLMoSequentialBlock(OLMoBlock):
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
 
         # apply norm before
-        if not self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                h = self._activation_checkpoint_fn(self.attn_norm, x)
-            else:
-                h = self.attn_norm(x)
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.attn_norm, x)
         else:
-            h = x
+            x = self.attn_norm(x)
 
-        qkv = self.att_proj(h)
+        qkv = self.att_proj(x)
 
         if self.config.clip_qkv is not None:
             qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
@@ -795,28 +831,25 @@ class OLMoSequentialBlock(OLMoBlock):
                 max_doc_len=max_doc_len,
                 cu_doc_lens=cu_doc_lens,
             )
-
-        if self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                att = self._activation_checkpoint_fn(self.attn_norm, att)
-            else:
-                att = self.attn_norm(att)
-
         # Add attention scores.
         # shape: (B, T, C)
         x = x + self.dropout(att)
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
+
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
+        else:
+            x = self.ff_norm(x)
+
         og_x = x
 
-        if not self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
-            else:
-                x = self.ff_norm(x)
-
         x = self.ff_proj(x)
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.fc1_norm, x)
+        else:
+            x = self.fc1_norm(x)
 
         if self._activation_checkpoint_fn is not None:
             x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
@@ -824,11 +857,10 @@ class OLMoSequentialBlock(OLMoBlock):
             x = self.act(x)
         x = self.ff_out(x)
 
-        if self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
-            else:
-                x = self.ff_norm(x)
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.fc2_norm, x)
+        else:
+            x = self.fc2_norm(x)
 
         x = self.dropout(x)
         x = og_x + x

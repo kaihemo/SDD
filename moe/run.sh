@@ -37,7 +37,7 @@ MOUNT_DIR="/mnt/hdfs/mount_dir"
 CODE_DIR="/opt/tiger/olmoe"
 
 # 以下为可修改的几个配置
-export run_name="olmoe_1bin7b_64H100"
+export run_name="olmoe_1bin7b_sdd_64H100"
 CONFIG_PATH=${CODE_DIR}/configs/exps/OLMoE-1B-7B-0906_reproduce.yml
 SAVE_DIR="${MOUNT_DIR}/olmoe_exps/${run_name}"
 # ===========================  Mount Configuration ===========================
@@ -115,7 +115,7 @@ sh launch.sh ${CONFIG_PATH} \
 --activation_checkpointing=fine_grained \
 --model.init_fn="full_megatron" \
 --save_num_checkpoints_to_keep=20 \
---model.init_std=0.013975424859373685 \
+--model.init_std=0.0013975424859373685 \
 --model.activation_type="swiglu" \
 --model.mlp_hidden_size=2048 \
 --max_duration=5e11T
